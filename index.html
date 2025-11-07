@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Music Visualizer — Bars & Wave</title>
+  <style>
+    :root{
+      --bg:#0b1020;--panel:#0f1724;--accent:#7c3aed;--muted:#9aa4bf;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;font-family:Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial}
+    body{background:linear-gradient(180deg,var(--bg),#071025);color:#e6eef8;display:flex;align-items:center;justify-content:center;padding:28px}
+    .app{width:100%;max-width:1100px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.08));border-radius:12px;padding:14px;box-shadow:0 10px 30px rgba(2,6,23,0.6)}
+    .top{display:flex;gap:12px;align-items:center;margin-bottom:10px}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .btn{background:var(--panel);border:1px solid rgba(255,255,255,0.03);padding:8px 12px;border-radius:8px;color:var(--muted);cursor:pointer}
+    .btn.primary{background:linear-gradient(90deg,var(--accent),#3b82f6);color:white;border:none}
+    .range{display:inline-flex;flex-direction:column;font-size:12px;color:var(--muted)}
+    input[type=file]{display:none}
+    label.filebtn{cursor:pointer}
+    .settings{display:flex;gap:12px;align-items:center;margin-left:auto}
+    .canvas-wrap{background:rgba(0,0,0,0.15);border-radius:10px;padding:12px}
+    canvas{display:block;width:100%;height:420px;border-radius:8px}
+    .status{margin-left:12px;color:#ffd36b;font-size:13px}
+    .footer{margin-top:10px;color:var(--muted);font-size:13px;display:flex;justify-content:space-between}
+    .credit{opacity:0.9}
+    @media (max-width:700px){.top{flex-direction:column;align-items:stretch}.settings{margin-left:0}}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="top">
+      <div class="controls">
+        <label class="filebtn btn">
+          Select audio
+          <input id="file" type="file" accept="audio/*">
+        </label>
+        <button id="btnPlay" class="btn primary">Play / Resume</button>
+        <button id="btnPause" class="btn">Pause</button>
+        <button id="btnMic" class="btn">Use Microphone</button>
+        <button id="btnStopMic" class="btn">Stop Mic</button>
+        <select id="mode" class="btn" title="Visualization mode">
+          <option value="bars">Bars (spectrum)</option>
+          <option value="wave">Waveform</option>
+        </select>
+        <div id="status" class="status" aria-live="polite">Ready</div>
+      </div>
+      <div class="settings">
+        <div class="range">
+          <label for="fft">FFT (bins)</label>
+          <select id="fft" class="btn">
+            <option value="32">32</option>
+            <option value="64">64</option>
+            <option value="128">128</option>
+            <option value="256" selected>256</option>
+            <option value="512">512</option>
+            <option value="1024">1024</option>
+            <option value="2048">2048</option>
+          </select>
+        </div>
+        <div class="range">
+          <label for="smoothing">Smoothing</label>
+          <input id="smoothing" type="range" min="0" max="0.99" step="0.01" value="0.6">
+        </div>
+        <div class="range">
+          <label for="color">Accent color</label>
+          <input id="color" type="color" value="#7c3aed" title="Pick accent color">
+        </div>
+      </div>
+    </div>
+
+    <div class="canvas-wrap">
+      <canvas id="vis"></canvas>
+    </div>
+
+    <div class="footer">
+      <div class="credit">WebAudio API visualizer — drag an audio file or use the microphone</div>
+      <div class="credit">Tip: allow mic permission for real-time input</div>
+    </div>
+  </div>
+
+<script>
+// Updated Music Visualizer — fixed mic permission handling and robust media source management
+
+let audioCtx = null;
+let analyser = null;
+let dataArray = null;
+let bufferLength = 0;
+let animationId = null;
+let audioElement = new Audio();
+let mediaElementSource = null; // keep one MediaElementSource per element
+let micSource = null;
+let isMicOn = false;
+
+const canvas = document.getElementById('vis');
+const ctx = canvas.getContext('2d');
+const fileInput = document.getElementById('file');
+const btnPlay = document.getElementById('btnPlay');
+const btnPause = document.getElementById('btnPause');
+const btnMic = document.getElementById('btnMic');
+const btnStopMic = document.getElementById('btnStopMic');
+const modeSel = document.getElementById('mode');
+const fftSel = document.getElementById('fft');
+const smoothRange = document.getElementById('smoothing');
+const colorInput = document.getElementById('color');
+const statusEl = document.getElementById('status');
+
+function setStatus(s){ statusEl.textContent = s; }
+
+function createAudioContextIfNeeded(){
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (!analyser) {
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = parseInt(fftSel.value);
+    analyser.smoothingTimeConstant = parseFloat(smoothRange.value);
+  }
+}
+
+function connectToAnalyser(sourceNode){
+  // disconnect previous connections safely
+  try{ analyser.disconnect(); }catch(e){}
+  try{ sourceNode.disconnect(); }catch(e){}
+
+  sourceNode.connect(analyser);
+  analyser.connect(audioCtx.destination);
+}
+
+function startVisualization(){
+  if(!analyser){ setStatus('No analyser — set up audio first'); return; }
+  cancelAnimationFrame(animationId);
+  bufferLength = analyser.frequencyBinCount;
+  dataArray = new Uint8Array(bufferLength);
+  resizeCanvas();
+  draw();
+}
+
+function draw(){
+  animationId = requestAnimationFrame(draw);
+  const width = canvas.width;
+  const height = canvas.height;
+  // clear with devicePixel aware rectangle
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0,0,width,height);
+
+  const mode = modeSel.value;
+  if(mode === 'bars'){
+    analyser.getByteFrequencyData(dataArray);
+    const barWidth = Math.max(1, (width / bufferLength) * 1.5);
+    let x = 0;
+
+    const grad = ctx.createLinearGradient(0,0,width,0);
+    grad.addColorStop(0, '#fff');
+    grad.addColorStop(0.5, colorInput.value);
+    grad.addColorStop(1, '#000');
+    ctx.fillStyle = grad;
+
+    // draw bars (use logical pixels)
+    for(let i=0;i<bufferLength;i++){
+      const v = dataArray[i] / 255;
+      const barHeight = v * (height) * 0.95;
+      ctx.fillRect(x, height - barHeight, barWidth, barHeight);
+      x += barWidth + 1;
+    }
+
+  } else {
+    analyser.getByteTimeDomainData(dataArray);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const sliceWidth = width * 1.0 / bufferLength;
+    let x = 0;
+    for(let i=0;i<bufferLength;i++){
+      const v = dataArray[i] / 128.0; // 128 is mid (for 8-bit)
+      const y = v * height/2;
+      if(i===0){ ctx.moveTo(x,y); } else { ctx.lineTo(x,y); }
+      x += sliceWidth;
+    }
+    ctx.strokeStyle = colorInput.value;
+    ctx.stroke();
+
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = colorInput.value + '22';
+    ctx.fillRect(0,0,width,height);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}
+
+function resizeCanvas(){
+  // reset transform and handle devicePixelRatio for crisp visuals
+  ctx.setTransform(1,0,0,1,0,0);
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.floor(rect.width * dpr);
+  canvas.height = Math.floor(rect.height * dpr);
+  // scale drawing operations to device pixels but keep logical coordinate system
+  ctx.scale(dpr, dpr);
+}
+
+window.addEventListener('resize', () => { resizeCanvas(); });
+
+// --- File input handler ---
+fileInput.addEventListener('change', async (e)=>{
+  const f = e.target.files && e.target.files[0];
+  if(!f) return;
+
+  // This event is a user gesture in most browsers — resume the context if needed
+  try{
+    createAudioContextIfNeeded();
+    if(audioCtx.state === 'suspended') await audioCtx.resume();
+  }catch(err){ console.warn('AudioContext resume failed', err); }
+
+  stopMic();
+
+  // tear down existing media element source (if any) before reusing audioElement
+  try{ if(mediaElementSource){ mediaElementSource.disconnect(); mediaElementSource = null; } }catch(e){}
+
+  const url = URL.createObjectURL(f);
+  audioElement.src = url;
+  audioElement.crossOrigin = 'anonymous';
+  audioElement.loop = false;
+  audioElement.load();
+
+  // Play after user interaction — file input is usually considered one
+  try{
+    await audioElement.play();
+    setStatus('Playing uploaded file');
+  }catch(err){
+    // Play may be blocked; inform user
+    console.warn('Playback failed:', err);
+    setStatus('Playback blocked — click Play to start');
+  }
+
+  // Create a single MediaElementSource — some browsers will throw if created multiple times
+  try{
+    createAudioContextIfNeeded();
+    if(!mediaElementSource){
+      mediaElementSource = audioCtx.createMediaElementSource(audioElement);
+    }
+    connectToAnalyser(mediaElementSource);
+    startVisualization();
+  }catch(err){
+    console.error('Failed to create MediaElementSource:', err);
+    setStatus('Could not connect audio element to analyser — see console');
+  }
+});
+
+// Play / Resume
+btnPlay.addEventListener('click', async ()=>{
+  createAudioContextIfNeeded();
+  try{ if(audioCtx.state === 'suspended') await audioCtx.resume(); }catch(e){}
+
+  if(isMicOn){ setStatus('Microphone active'); return; }
+
+  if(audioElement.src){
+    try{ await audioElement.play(); setStatus('Resumed'); }
+    catch(err){ console.warn('Play failed', err); setStatus('Play blocked — user gesture required'); }
+  } else {
+    setStatus('No file loaded — select a file or use microphone');
+  }
+});
+
+// Pause
+btnPause.addEventListener('click', ()=>{
+  if(audioElement && !audioElement.paused) audioElement.pause();
+  try{ if(audioCtx && audioCtx.state === 'running') audioCtx.suspend(); }catch(e){}
+  setStatus('Paused');
+});
+
+// --- Microphone handling with permission checks and graceful errors ---
+async function checkMicrophonePermission(){
+  // Not all browsers support navigator.permissions for microphone; handle gracefully
+  try{
+    if(navigator.permissions && navigator.permissions.query){
+      const status = await navigator.permissions.query({ name: 'microphone' });
+      return status.state; // 'granted' | 'denied' | 'prompt'
+    }
+  }catch(e){ /* ignore */ }
+  return 'prompt';
+}
+
+btnMic.addEventListener('click', async ()=>{
+  // ensure user gesture and context available
+  createAudioContextIfNeeded();
+  try{ if(audioCtx.state === 'suspended') await audioCtx.resume(); }catch(e){}
+
+  const perm = await checkMicrophonePermission();
+  if(perm === 'denied'){
+    setStatus('Microphone permission denied — check browser settings');
+    alert('Microphone access is blocked. Please enable microphone permission for this site in your browser settings.');
+    return;
+  }
+
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    alert('Microphone not supported in this browser.');
+    return;
+  }
+
+  setStatus('Requesting microphone...');
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    // stop any playing audio element so we only visualize mic
+    try{ audioElement.pause(); }catch(e){}
+
+    // disconnect any previous sources
+    try{ if(mediaElementSource){ mediaElementSource.disconnect(); } }catch(e){}
+    try{ if(analyser) analyser.disconnect(); }catch(e){}
+
+    micSource = audioCtx.createMediaStreamSource(stream);
+    connectToAnalyser(micSource);
+    isMicOn = true;
+    // remember mic stream tracks to stop later
+    micSource._stream = stream;
+    startVisualization();
+    setStatus('Microphone active');
+  }catch(err){
+    console.error('getUserMedia error:', err);
+    if(err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')){
+      setStatus('Permission denied for microphone');
+      alert('Microphone permission was denied. To fix: allow microphone for this page in browser settings and reload.');
+    } else {
+      setStatus('Could not access microphone');
+      alert('Could not access microphone. See console for details.');
+    }
+  }
+});
+
+btnStopMic.addEventListener('click', ()=>{ stopMic(); });
+
+function stopMic(){
+  if(micSource && micSource._stream){
+    try{ micSource._stream.getTracks().forEach(t=>t.stop()); }catch(e){}
+    micSource = null;
+  }
+  isMicOn = false;
+  // reconnect audio element if there is a loaded file
+  try{
+    if(mediaElementSource && audioElement.src){
+      connectToAnalyser(mediaElementSource);
+      setStatus('Switched to audio element (file)');
+    } else if(analyser){
+      analyser.disconnect();
+      setStatus('Stopped microphone');
+    }
+  }catch(e){ console.warn('stopMic reconnection error', e); }
+}
+
+function stopAudioElement(){
+  try{ if(audioElement){ audioElement.pause(); audioElement.src = ''; } }catch(e){}
+}
+
+// Controls: fft, smoothing, mode, color
+fftSel.addEventListener('change', ()=>{
+  if(!analyser) return;
+  const val = parseInt(fftSel.value);
+  analyser.fftSize = val;
+  bufferLength = analyser.frequencyBinCount;
+  dataArray = new Uint8Array(bufferLength);
+});
+
+smoothRange.addEventListener('input', ()=>{
+  if(analyser) analyser.smoothingTimeConstant = parseFloat(smoothRange.value);
+});
+
+modeSel.addEventListener('change', ()=>{});
+colorInput.addEventListener('input', ()=>{});
+
+// Initial placeholder
+(function init(){
+  resizeCanvas();
+  ctx.font = '16px system-ui';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,0.06)';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle = '#9aa4bf';
+  ctx.fillText('Drop or select an audio file, or use the microphone', canvas.getBoundingClientRect().width/2, canvas.getBoundingClientRect().height/2);
+  setStatus('Ready');
+})();
+
+// Clean up when page unloads
+window.addEventListener('pagehide', ()=>{
+  cancelAnimationFrame(animationId);
+  try{ if(audioCtx && typeof audioCtx.close === 'function') audioCtx.close(); }catch(e){}
+});
+
+</script>
+</body>
+</html>
